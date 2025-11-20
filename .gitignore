@@ -6,6 +6,7 @@
 
 # Python 파일은 무시하지 않음
 !*.py
+!*.v
 
 # .gitignore와 README는 항상 추적
 !.gitignore
