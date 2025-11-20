@@ -1,0 +1,12 @@
+# 모든 파일 무시
+*
+
+# 모든 폴더는 무시하지 않음 (폴더 내부 규칙 적용 가능하게)
+!*/
+
+# Python 파일은 무시하지 않음
+!*.py
+
+# .gitignore와 README는 항상 추적
+!.gitignore
+!README.md
