@@ -1,15 +1,19 @@
 # ============================================================
 # made by 이수찬(suchan lee)
 #
-# 사용방법 : 프로그램과 .v 파일들을 같은 디렉토리에 넣고
-# 예시) python auto_vsim.py crossbar.v adder.v mux.v mac.v -> 이런식으로 실행하면
-# 파일에서 모듈들을 읽어서 프로그램이 모듈들을 나열해줌
+# 작동을 위해 golden_base 필요
+# 사용방법 : 프로그램과 골든모델(.py)(선택사항), 베릴로그(.v) 파일들을 같은 디렉토리에 넣고
+# 예시)  python auto_vsim.py golden_model.py file1.v file2.v ... -> 이런식으로 실행하면
+# 파일에서 모듈들을 읽어서 프로그램이 베릴로그 모듈들을 나열해줌
 # top_module을 지정하면 top_module의 포트와 파라마터를 읽어서 자동으로 tb 생성
 # 포트와 파라마터를 이용하여 자동으로 hex파일들(clk,rst를 제외한 포트 입력) 랜덤하게 생성
-# 결과물을 SystemVerilog 모드로 컴파일
-# 결과는 results/ 폴더 안에 TB 파일, hex파일, 시뮬 로그가 저장
+# vsim 결과물을 SystemVerilog 모드로 컴파일
+
+# 골든모델(sw의 tb 역할까지 같이함)은 사람이 직접 작성. 골든 모델도 베릴로그와 같은 hex기반으로 실험함(결과 비교를 위해)
+# 결과는 results/ 폴더 안에    골든모델 결과 ,TB 파일, hex파일, 시뮬 로그가 저장
 # ============================================================
 
+import importlib.util
 import re
 import subprocess
 import sys
@@ -509,16 +513,111 @@ def generate_hex_inputs(ports, params, case_id, cycles, result_dir):
 
         print(f"[+] Generated HEX: {hex_path} (width {width} bits, {hex_digits} hex digits)")
 
+# ============================================================
+# 골든모델 로드
+# ============================================================
+
+def load_golden_model(golden_file_path):
+
+    if not os.path.exists(golden_file_path):
+        raise FileNotFoundError(f"Golden model file not found: {golden_file_path}")
+
+    spec = importlib.util.spec_from_file_location("golden_module", golden_file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    candidate = None
+
+    for attr in dir(module):
+        obj = getattr(module, attr)
+
+        # 오직 '클래스'만 허용
+        if isinstance(obj, type):
+            if candidate is not None:
+                raise RuntimeError(f"Multiple classes found in {golden_file_path}")
+            candidate = obj
+
+    if candidate is None:
+        raise RuntimeError(f"No class found in {golden_file_path}")
+
+    return candidate
+
+
+
+
+# ============================================================
+# 골든모델 실행
+# ============================================================
+def run_golden_model(GoldenClass, params_dict, input_hex_map, save_path, cycles):
+    """
+    GoldenClass     : load_golden_model()이 리턴한 '클래스'
+    params_dict     : {"INPUT_COUNT":8, "DATA_WIDTH":16} 등 파라미터
+    input_hex_map   : {"i_data": ".../i_data_case0.hex", "sel":"..."}
+    save_path       : 저장할 golden 출력 파일
+    cycles          : 반복 횟수
+    """
+
+    # GoldenClass 인스턴스 생성
+    golden = GoldenClass(params_dict)
+
+    # 입력 파일들 오픈
+    fds = {}
+    for port, filepath in input_hex_map.items():
+        fds[port] = open(filepath, "r")
+
+    # 출력 파일 오픈
+    fo = open(save_path, "w")
+
+    # 골든모델 초기화
+    golden.reset()
+
+    # ---- 사이클 반복 ----
+    for cycle in range(cycles):
+        input_vals = {}
+
+        # 모든 입력 포트에 대해 hex 읽기
+        for port, fd in fds.items():
+            line = fd.readline()
+
+            if not line:          # EOF
+                val = 0
+            else:
+                line = line.strip()
+                if line == "":
+                    val = 0
+                else:
+                    val = int(line, 16)
+
+            input_vals[port] = val
+
+        # 한 사이클 실행
+        out_vals = golden.step(input_vals)
+
+        # 출력 기록(JSON 비슷한 형태)
+        fo.write(f"Cycle {cycle}: {out_vals}\n")
+
+    # ---- 파일 닫기 ----
+    for fd in fds.values():
+        fd.close()
+    fo.close()
+
 
 # ============================================================
 # Main
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python auto_vsim.py file1.v file2.v ...")
+        print("Usage: python auto_vsim.py(not mandatory) golden_model.py file1.v file2.v ...")
         sys.exit(1)
+    golden_file=None
 
-    vfiles = sys.argv[1:]
+    if sys.argv[1].endswith(".py"):
+        golden_file = sys.argv[1]
+
+        vfiles = sys.argv[2:]
+    else:
+        vfiles = sys.argv[1:]
+
     check_modelsim()
     result_dir = make_result_dir()
 
@@ -588,6 +687,43 @@ def main():
 
     print("\n[완료] All simulations finished.\n")
 
+    ###########################################
+    #여기서부터는 골든모델
+    ###########################################
+    if golden_file != None :
+        # 1) Golden Model 클래스 로드
+        GoldenClass = load_golden_model(golden_file)
+
+        # 2) 파라미터 dict 준비
+        params_dict = {k:int(v) for (k,v) in params}
+
+        # 3) Golden Model 인스턴스 생성
+        golden = GoldenClass(params_dict)
+
+        # 4) 입력 HEX 파일 매핑 (clk / rst_n 제외)
+        input_hex_map = {}
+        for p in ports:
+            if p["dir"] == "input" and p["name"] not in (clk_name, reset_name):
+                hex_path = os.path.join(result_dir, f"{p['name']}_case{case_id}.hex")
+                input_hex_map[p["name"]] = hex_path
+
+        # 5) 출력 파일 경로
+        golden_output_path = os.path.join(result_dir, f"golden_case{case_id}.txt")
+
+        # 6) Golden Model 실행
+        run_golden_model(
+            golden,              # 반드시 인스턴스!
+            params_dict,
+            input_hex_map,       # {"i_data":"...", "sel":"..."}
+            golden_output_path,  # 출력 파일
+            cycles               # 사이클 수
+        )
+    
+
+
+    ###########################################
+    #여기까지 골든모델
+    ###########################################
 
 if __name__ == "__main__":
     main()
