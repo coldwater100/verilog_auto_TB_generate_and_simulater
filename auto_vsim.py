@@ -1,8 +1,8 @@
 # ============================================================
 # made by 이수찬(suchan lee)
 #
-# 작동을 위해 golden_base 필요
-# 사용방법 : 프로그램과 골든모델(.py)(선택사항), 베릴로그(.v) 파일들을 같은 디렉토리에 넣고
+# 
+# 사용방법 : 프로그램과 베릴로그(.v) 파일들을 같은 디렉토리에 넣고
 # 예시)  python auto_vsim.py golden_model.py file1.v file2.v ... -> 이런식으로 실행하면
 # 파일에서 모듈들을 읽어서 프로그램이 베릴로그 모듈들을 나열해줌
 # top_module을 지정하면 top_module의 포트와 파라마터를 읽어서 자동으로 tb 생성
@@ -13,6 +13,7 @@
 # 결과는 results/ 폴더 안에    골든모델 결과 ,TB 파일, hex파일, 시뮬 로그가 저장
 # ============================================================
 
+import shutil
 import importlib.util
 import re
 import subprocess
@@ -21,17 +22,24 @@ import os
 import platform
 import random
 import math
+import json
+
 
 # ============================================================
 # Make result directory
 # ============================================================
 def make_result_dir():
     result_dir = "results"
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir)
-        print(f"[+] Created result directory: {result_dir}")
-    else:
-        print(f"[+] Using existing directory: {result_dir}")
+
+    # 디렉토리가 이미 존재하면 삭제
+    if os.path.exists(result_dir):
+        shutil.rmtree(result_dir)
+        print(f"[+] Removed existing directory: {result_dir}")
+
+    # 새로 생성
+    os.makedirs(result_dir)
+    print(f"[+] Created result directory: {result_dir}")
+
     return result_dir
 
 
@@ -514,92 +522,110 @@ def generate_hex_inputs(ports, params, case_id, cycles, result_dir):
         print(f"[+] Generated HEX: {hex_path} (width {width} bits, {hex_digits} hex digits)")
 
 # ============================================================
-# 골든모델 로드
+# json저장
 # ============================================================
 
-def load_golden_model(golden_file_path):
+def save_case_json(case_id, ports, params, cycles, result_dir):
 
-    if not os.path.exists(golden_file_path):
-        raise FileNotFoundError(f"Golden model file not found: {golden_file_path}")
+    params_dict = {k: int(v) for (k, v) in params}
 
-    spec = importlib.util.spec_from_file_location("golden_module", golden_file_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    port_dicts = []
+    for p in ports:
+        port_dicts.append({
+            "dir": p["dir"],
+            "name": p["name"],
+            "full_decl": p["full"]
+        })
 
-    candidate = None
+    input_ports = [
+        p["name"] for p in ports
+        if p["dir"] == "input" and p["name"] not in ("clk", "rst_n")
+    ]
 
-    for attr in dir(module):
-        obj = getattr(module, attr)
+    output_ports = [
+        p["name"] for p in ports
+        if p["dir"] == "output"
+    ]
 
-        # 오직 '클래스'만 허용
-        if isinstance(obj, type):
-            if candidate is not None:
-                raise RuntimeError(f"Multiple classes found in {golden_file_path}")
-            candidate = obj
+    hex_files = {
+        p: os.path.join(result_dir, f"{p}_case{case_id}.hex")
+        for p in input_ports
+    }
 
-    if candidate is None:
-        raise RuntimeError(f"No class found in {golden_file_path}")
+    data = {
+        "case_id": case_id,
+        "cycles": cycles,
+        "params": params_dict,
+        "ports": port_dicts,
+        "input_ports": input_ports,
+        "output_ports": output_ports,
+        "hex_files": hex_files
+    }
 
-    return candidate
+    json_path = os.path.join(result_dir, f"config_case{case_id}.json")
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent=4)
 
-
-
+    print(f"[+] Saved JSON config: {json_path}")
+    return json_path
 
 # ============================================================
-# 골든모델 실행
+# vsim출력을 csv형태로 바꾸기
 # ============================================================
-def run_golden_model(GoldenClass, params_dict, input_hex_map, save_path, cycles):
-    """
-    GoldenClass     : load_golden_model()이 리턴한 '클래스'
-    params_dict     : {"INPUT_COUNT":8, "DATA_WIDTH":16} 등 파라미터
-    input_hex_map   : {"i_data": ".../i_data_case0.hex", "sel":"..."}
-    save_path       : 저장할 golden 출력 파일
-    cycles          : 반복 횟수
-    """
+def sim_to_csv(sim_log, out_csv):
 
-    # GoldenClass 인스턴스 생성
-    golden = GoldenClass(params_dict)
+    cycle = None
+    current_values = {}   # {port_name: value}
+    output_ports = []     # 포트 리스트 (처음 발견 시 자동 기록)
 
-    # 입력 파일들 오픈
-    fds = {}
-    for port, filepath in input_hex_map.items():
-        fds[port] = open(filepath, "r")
+    with open(sim_log, "r") as f:
+        lines = f.readlines()
 
-    # 출력 파일 오픈
-    fo = open(save_path, "w")
+    # 1. 먼저 모든 출력 포트를 자동 감지
+    for line in lines:
+        m_port = re.search(r"#\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9a-fA-Fx]+)", line)
+        if m_port:
+            port = m_port.group(1)
+            if port not in output_ports:
+                output_ports.append(port)
 
-    # 골든모델 초기화
-    golden.reset()
+    # 2. CSV 생성
+    with open(out_csv, "w") as w:
 
-    # ---- 사이클 반복 ----
-    for cycle in range(cycles):
-        input_vals = {}
+        # CSV header
+        w.write("cycle," + ",".join(output_ports) + "\n")
 
-        # 모든 입력 포트에 대해 hex 읽기
-        for port, fd in fds.items():
-            line = fd.readline()
+        for line in lines:
+            line = line.strip()
 
-            if not line:          # EOF
-                val = 0
-            else:
-                line = line.strip()
-                if line == "":
-                    val = 0
-                else:
-                    val = int(line, 16)
+            # (1) Cycle 번호 찾기
+            m = re.match(r"#?\s*\[Cycle\s+(\d+)\]", line)
+            if m:
+                # 이전 cycle 값 쓰기
+                if cycle is not None:
+                    row = [str(cycle)]
+                    for p in output_ports:
+                        row.append(current_values.get(p, "xxxxx"))
+                    w.write(",".join(row) + "\n")
 
-            input_vals[port] = val
+                cycle = int(m.group(1))
+                current_values = {}  # 새 사이클 값 초기화
+                continue
 
-        # 한 사이클 실행
-        out_vals = golden.step(input_vals)
+            # (2) '포트명 = 값' 찾기
+            m2 = re.match(r"#?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9a-fA-Fx]+)", line)
+            if m2:
+                port = m2.group(1)
+                value = m2.group(2)
+                current_values[port] = value
 
-        # 출력 기록(JSON 비슷한 형태)
-        fo.write(f"Cycle {cycle}: {out_vals}\n")
+        # 마지막 cycle 출력
+        if cycle is not None:
+            row = [str(cycle)]
+            for p in output_ports:
+                row.append(current_values.get(p, "xxxxx"))
+            w.write(",".join(row) + "\n")
 
-    # ---- 파일 닫기 ----
-    for fd in fds.values():
-        fd.close()
-    fo.close()
 
 
 # ============================================================
@@ -607,16 +633,10 @@ def run_golden_model(GoldenClass, params_dict, input_hex_map, save_path, cycles)
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python auto_vsim.py(not mandatory) golden_model.py file1.v file2.v ...")
+        print("Usage: python auto_vsim.py file1.v file2.v ...")
         sys.exit(1)
-    golden_file=None
 
-    if sys.argv[1].endswith(".py"):
-        golden_file = sys.argv[1]
-
-        vfiles = sys.argv[2:]
-    else:
-        vfiles = sys.argv[1:]
+    vfiles = sys.argv[1:]
 
     check_modelsim()
     result_dir = make_result_dir()
@@ -649,6 +669,7 @@ def main():
         tb_file = save_tb_case(top_module, tb_text, case_id)
         tb_files.append(tb_file)
         generate_hex_inputs(ports, params,case_id, cycles, result_dir)
+        save_case_json(case_id, ports, params, cycles, result_dir)
 
     # ============================================================
     # ModelSim 작업 공간 생성
@@ -682,48 +703,12 @@ def main():
             ["vsim", "-c", tb_modname, "-do", "run -all; quit;"],
             sim_log
         )
+        csv_log=os.path.join(result_dir, f"csv_result_case{case_id}.csv")
+        sim_to_csv(sim_log,csv_log)
 
         print(f"[+] Simulation log saved: {sim_log}")
 
     print("\n[완료] All simulations finished.\n")
-
-    ###########################################
-    #여기서부터는 골든모델
-    ###########################################
-    if golden_file != None :
-        # 1) Golden Model 클래스 로드
-        GoldenClass = load_golden_model(golden_file)
-
-        # 2) 파라미터 dict 준비
-        params_dict = {k:int(v) for (k,v) in params}
-
-        # 3) Golden Model 인스턴스 생성
-        golden = GoldenClass(params_dict)
-
-        # 4) 입력 HEX 파일 매핑 (clk / rst_n 제외)
-        input_hex_map = {}
-        for p in ports:
-            if p["dir"] == "input" and p["name"] not in (clk_name, reset_name):
-                hex_path = os.path.join(result_dir, f"{p['name']}_case{case_id}.hex")
-                input_hex_map[p["name"]] = hex_path
-
-        # 5) 출력 파일 경로
-        golden_output_path = os.path.join(result_dir, f"golden_case{case_id}.txt")
-
-        # 6) Golden Model 실행
-        run_golden_model(
-            golden,              # 반드시 인스턴스!
-            params_dict,
-            input_hex_map,       # {"i_data":"...", "sel":"..."}
-            golden_output_path,  # 출력 파일
-            cycles               # 사이클 수
-        )
-    
-
-
-    ###########################################
-    #여기까지 골든모델
-    ###########################################
 
 if __name__ == "__main__":
     main()
